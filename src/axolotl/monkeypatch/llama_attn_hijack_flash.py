@@ -2,7 +2,9 @@
 
 # copied from https://github.com/lm-sys/FastChat/blob/main/fastchat/train/llama_flash_attn_monkey_patch.py
 
+import logging
 import warnings
+from functools import partial
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -11,12 +13,18 @@ import transformers
 from einops import rearrange
 from flash_attn.bert_padding import pad_input, unpad_input
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaAttention
 from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer as OriginalLlamaDecoderLayer,
 )
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+from transformers.models.llama.modeling_llama import (
+    LlamaMLP,
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
+from xformers.ops import SwiGLU
 
-from axolotl.monkeypatch.utils import get_cu_seqlens_from_pos_ids
+from axolotl.monkeypatch.utils import get_cu_seqlens_from_pos_ids, set_module_name
 
 try:
     from flash_attn.flash_attn_interface import (  # pylint: disable=ungrouped-imports
@@ -33,7 +41,36 @@ except ImportError:
     )
 
 
-def replace_llama_attn_with_flash_attn(packed: Optional[bool] = False):
+LOG = logging.getLogger("axolotl")
+
+
+def replace_llama_mlp_with_swiglu(model):
+    for name, module in model.named_modules():
+        if isinstance(module, LlamaMLP):
+            mlp = FusedMLP(
+                module.config, module.gate_proj, module.up_proj, module.down_proj
+            )
+            set_module_name(model, name, mlp)
+
+
+def replace_llama_qkv_with_fused(model):
+    for name, module in model.named_modules():
+        if isinstance(module, LlamaAttention):
+            qkv = FusedAttention(
+                module.config,
+                module.q_proj,
+                module.k_proj,
+                module.v_proj,
+                module.o_proj,
+            )
+            set_module_name(model, name, qkv)
+
+
+def replace_llama_attn_with_flash_attn(
+    packed: Optional[bool] = False,
+    cross_entropy: Optional[bool] = False,
+    rms_norm: Optional[bool] = False,
+):
     transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (  # pylint: disable=protected-access
         _prepare_decoder_attention_mask
     )
@@ -43,6 +80,124 @@ def replace_llama_attn_with_flash_attn(packed: Optional[bool] = False):
         transformers.models.llama.modeling_llama.LlamaModel.forward = (
             llama_model_forward
         )
+
+    # skip only if explicitly disabled
+    if cross_entropy:
+        try:
+            from flash_attn.losses.cross_entropy import CrossEntropyLoss
+
+            LOG.info("patching with flash_attn.losses.cross_entropy")
+            transformers.models.llama.modeling_llama.CrossEntropyLoss = partial(
+                CrossEntropyLoss, inplace_backward=True
+            )
+        except ImportError:
+            LOG.info(
+                "optimized flash-attention CrossEntropyLoss not found (run `pip install 'git+https://github.com/Dao-AILab/flash-attention.git#egg=xentropy_cuda_lib&subdirectory=csrc/xentropy'`)"
+            )
+
+    # skip only if explicitly disabled
+    if rms_norm:
+        try:
+            from flash_attn.ops.rms_norm import RMSNorm
+
+            class LlamaRMSNorm(RMSNorm):
+                """Patched LLamaRMSNorm"""
+
+                def __init__(self, hidden_size, eps=1e-6):
+                    super().__init__(hidden_size, eps=eps)
+
+            LOG.info("patching with flash_attn.ops.rms_norm")
+            transformers.models.llama.modeling_llama.LlamaRMSNorm = LlamaRMSNorm
+        except ImportError:
+            LOG.info(
+                "optimized flash-attention RMSNorm not found (run `pip install 'git+https://github.com/Dao-AILab/flash-attention.git#egg=dropout_layer_norm&subdirectory=csrc/layer_norm'`)"
+            )
+
+
+class FusedAttention(LlamaAttention):
+    """
+    Fused QKV Attention layer for incrementally improved training efficiency
+    """
+
+    def __init__(
+        self,
+        config,
+        q: torch.nn.Linear,  # pylint: disable=invalid-name
+        k: torch.nn.Linear,  # pylint: disable=invalid-name
+        v: torch.nn.Linear,  # pylint: disable=invalid-name
+        o: torch.nn.Linear,  # pylint: disable=invalid-name
+    ):
+        super().__init__(config)
+        self.config = config
+        self.init_device = next(iter(q.state_dict().values())).device
+
+        # define equivalent fused qkv projection
+        self.out_features: List[int] = [q.out_features, k.out_features, v.out_features]
+        self.qkv_proj = torch.nn.Linear(
+            q.in_features, sum(self.out_features), device=self.init_device, bias=False
+        )
+        self.o_proj = o
+
+        # overwrite initialized weights with pretrained weights
+        self.qkv_proj.weight.data = torch.cat(
+            (q.weight.data, k.weight.data, v.weight.data), dim=0
+        )
+
+    def _post_training(self, model, name):
+        q_proj, k_proj, v_proj = torch.split(
+            self.qkv_proj.weight.data, self.out_features, dim=0
+        )
+
+        new_attn = LlamaAttention(self.config)
+        new_attn.q_proj.weight.data = q_proj
+        new_attn.k_proj.weight.data = k_proj
+        new_attn.v_proj.weight.data = v_proj
+        new_attn.o_proj.weight.data = self.o_proj.weight.data
+
+        set_module_name(model, name, new_attn)
+
+
+class FusedMLP(torch.nn.Module):
+    """
+    Fused MLP layer for incrementally improved training efficiency
+    """
+
+    def __init__(
+        self,
+        config,
+        gate_proj: torch.nn.Linear,
+        up_proj: torch.nn.Linear,
+        down_proj: torch.nn.Linear,
+    ):
+        super().__init__()
+        self.config = config
+        self.swiglu = SwiGLU(
+            in_features=config.hidden_size,
+            hidden_features=config.intermediate_size,
+            bias=False,
+            _pack_weights=True,
+        )
+        # overwrite initialized weights with pretrained weights
+        self.swiglu.w12.weight.data = torch.cat(
+            (gate_proj.weight.data, up_proj.weight.data), dim=0
+        )
+        self.swiglu.w3.weight.data = down_proj.weight.data
+
+    def _post_training(self, model, name):
+        w1, w2 = torch.split(  # pylint: disable=invalid-name
+            self.swiglu.w12.weight.data, self.config.intermediate_size, dim=0
+        )
+
+        # Assign the split weights back to the original layers
+        new_mlp = LlamaMLP(self.config)
+        new_mlp.gate_proj.weight.data = w1
+        new_mlp.up_proj.weight.data = w2
+        new_mlp.down_proj.weight.data = self.swiglu.w3.weight.data
+
+        set_module_name(model, name, new_mlp)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=invalid-name
+        return self.swiglu(x)
 
 
 # Disable the transformation of the attention mask in LlamaModel as the flash attention
@@ -66,6 +221,7 @@ def flashattn_forward(
     past_key_value: Optional[Tuple[torch.Tensor]] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    padding_mask: Optional[torch.LongTensor] = None,  # pylint: disable=unused-argument
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -105,9 +261,14 @@ def flashattn_forward(
         value_states = torch.cat(value_states, dim=-1)
 
     else:
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        if isinstance(self, FusedAttention):
+            query_states, key_states, value_states = self.qkv_proj(hidden_states).split(
+                self.out_features, dim=-1
+            )
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
 
     query_states = query_states.view(
         bsz, q_len, self.num_heads, self.head_dim
@@ -160,7 +321,9 @@ def flashattn_forward(
         # only on first autoregressive step q,k,v have same seqlen
         is_causal = key_states.shape == query_states.shape
 
-    if cu_seqlens is not None and max_seqlen is not None:
+    dropout_rate = 0.0 if not self.training else getattr(self, "attention_dropout", 0.0)
+
+    if cu_seqlens is not None and max_seqlen is not None and cu_seqlens.dim() == 1:
         # special handling using sample packing
         qkv = torch.stack(
             [query_states, key_states, value_states], dim=2
@@ -169,7 +332,12 @@ def flashattn_forward(
         qkv = rearrange(qkv, "b s ... -> (b s) ...")
 
         output = flash_attn_varlen_qkvpacked_func(
-            qkv, cu_seqlens, max_seqlen, 0.0, softmax_scale=None, causal=True
+            qkv,
+            cu_seqlens,
+            max_seqlen,
+            dropout_p=dropout_rate,
+            softmax_scale=None,
+            causal=True,
         )
         output = rearrange(output, "(b s) ... -> b s ...", b=bsz)
     elif query_states.shape == key_states.shape:
@@ -192,7 +360,7 @@ def flashattn_forward(
             qkv_unpad,
             cu_seqlens_q,
             max_seqlen_q,
-            0.0,
+            dropout_p=dropout_rate,
             softmax_scale=None,
             causal=is_causal,
         )
@@ -205,6 +373,7 @@ def flashattn_forward(
             output = flash_attn_kvpacked_func(
                 query_states,
                 torch.stack([key_states, value_states], 2),
+                dropout_p=dropout_rate,
                 causal=is_causal,
             )
         else:
@@ -228,6 +397,8 @@ def flashattn_forward(
                 if attention_mask is not None
                 else None,
             )
+            if q_unpad.dtype != kv_unpad.dtype:
+                kv_unpad = kv_unpad.to(q_unpad.dtype)
             output_unpad = flash_attn_varlen_kvpacked_func(
                 q_unpad,
                 kv_unpad,
@@ -235,7 +406,7 @@ def flashattn_forward(
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
-                0.0,
+                dropout_p=dropout_rate,
                 softmax_scale=None,
                 causal=is_causal,
             )
@@ -441,6 +612,13 @@ def llama_model_forward(
             dtype=torch.bool,
             device=inputs_embeds.device,
         )
+        padding_mask = None
+    else:
+        if 0 in attention_mask:
+            padding_mask = attention_mask
+        else:
+            padding_mask = None
+
     attention_mask = (
         self._prepare_decoder_attention_mask(  # pylint: disable=protected-access
             attention_mask,
@@ -475,7 +653,9 @@ def llama_model_forward(
             def create_custom_forward(module):
                 def custom_forward(*inputs):
                     # None for past_key_value
-                    return module(*inputs)
+                    return module(
+                        *inputs,
+                    )
 
                 return custom_forward
 
@@ -484,9 +664,10 @@ def llama_model_forward(
                 hidden_states,
                 attention_mask,
                 position_ids,
-                None,
+                past_key_value,
                 output_attentions,
                 None,
+                padding_mask,
                 cu_seqlens,
                 max_seqlen,
             )
@@ -498,6 +679,7 @@ def llama_model_forward(
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                padding_mask=padding_mask,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
@@ -544,6 +726,7 @@ class LlamaDecoderLayer(OriginalLlamaDecoderLayer):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        padding_mask: Optional[torch.LongTensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
     ) -> Tuple[
@@ -576,6 +759,7 @@ class LlamaDecoderLayer(OriginalLlamaDecoderLayer):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            padding_mask=padding_mask,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )

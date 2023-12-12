@@ -1,27 +1,28 @@
 """Module for models and model loading"""
-
-
 import logging
 import math
 import os
-from pathlib import Path
 from typing import Optional, Tuple  # noqa: F401
 
+import addict
 import bitsandbytes as bnb
 import torch
 import transformers
 from optimum.bettertransformer import BetterTransformer
-from peft import PeftConfig
+from peft import PeftConfig, prepare_model_for_kbit_training
+from peft.tuners.lora import QuantLinear
 from transformers import (  # noqa: F401
+    AddedToken,
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    LlamaConfig,
+    GPTQConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
 
+from axolotl.models.mamba import fix_mamba_attn_for_loss
 from axolotl.prompt_tokenizers import LLAMA_DEFAULT_EOS_TOKEN
 from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.dict import DictDefault
@@ -29,12 +30,51 @@ from axolotl.utils.dict import DictDefault
 LOG = logging.getLogger("axolotl")
 
 
+def check_model_config(cfg: DictDefault, model_config: AutoConfig):
+    quant_config_exists = hasattr(model_config, "quantization_config")
+    quant_config_method_is_gptq = (
+        quant_config_exists
+        and "quant_method" in model_config.quantization_config
+        and model_config.quantization_config["quant_method"] == "gptq"
+    )
+
+    if cfg.gptq and not quant_config_method_is_gptq:
+        raise ValueError(
+            "model_config.quantization_config is not set or quant_method is not set to gptq. "
+            "Please make sure to point to a GPTQ model."
+        )
+
+    if not cfg.gptq and quant_config_exists:
+        raise ValueError(
+            "model_config.quantization_config is set but `gptq` flag is not. "
+            "Please use the `gptq` flag to train quantized model or point to a non-quantized model."
+        )
+
+
 def load_model_config(cfg):
     model_config_name = cfg.base_model_config or cfg.base_model
-    trust_remote_code: bool = False or cfg.trust_remote_code
-    return AutoConfig.from_pretrained(
-        model_config_name, trust_remote_code=trust_remote_code
-    )
+    trust_remote_code = cfg.trust_remote_code is True
+
+    try:
+        model_config = AutoConfig.from_pretrained(
+            model_config_name, trust_remote_code=trust_remote_code
+        )
+    except ValueError as err:
+        if "mamba" in model_config_name:
+            return addict.Dict(
+                {
+                    "model_type": "mamba",
+                }
+            )
+        raise err
+
+    if cfg.model_config:
+        for key, val in cfg.model_config.items():
+            setattr(model_config, key, val)
+
+    check_model_config(cfg, model_config)
+
+    return model_config
 
 
 def load_tokenizer(cfg):
@@ -51,7 +91,7 @@ def load_tokenizer(cfg):
     if cfg.tokenizer_type:
         tokenizer_cls = getattr(transformers, cfg.tokenizer_type)
 
-    tokenizer_config = cfg.tokenizer_config or cfg.base_model_config
+    tokenizer_config = cfg.tokenizer_config or cfg.base_model_config or cfg.base_model
     tokenizer = tokenizer_cls.from_pretrained(
         tokenizer_config,
         trust_remote_code=cfg.trust_remote_code or False,
@@ -65,6 +105,7 @@ def load_tokenizer(cfg):
             "LlamaTokenizer",
             "LlamaTokenizerFast",
             "CodeLlamaTokenizer",
+            "CodeLlamaTokenizerFast",
         ]
         and hasattr(tokenizer, "pad_token")
         and not tokenizer.pad_token
@@ -72,20 +113,60 @@ def load_tokenizer(cfg):
         # set a pad_token, but use eos_token so we don't add a new token
         tokenizer.pad_token = LLAMA_DEFAULT_EOS_TOKEN
 
-    LOG.debug(f"EOS: {tokenizer.eos_token_id} / {tokenizer.eos_token}")
-    LOG.debug(f"BOS: {tokenizer.bos_token_id} / {tokenizer.bos_token}")
-    LOG.debug(f"PAD: {tokenizer.pad_token_id} / {tokenizer.pad_token}")
-    LOG.debug(f"UNK: {tokenizer.unk_token_id} / {tokenizer.unk_token}")
-
     if tokenizer.__class__.__name__ == "GPTNeoXTokenizerFast":
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+    # Mistral's official FA implementation requires left padding
+    if cfg.is_mistral_derived_model and cfg.flash_attention and not cfg.sample_packing:
+        tokenizer.padding_side = "left"
+
+    # Qwen base only has single token, so we need to set the special tokens
+    if cfg.is_qwen_derived_model:
+        token_ids = ["bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"]
+        for attr_name in token_ids:
+            if getattr(tokenizer, attr_name) is None:
+                setattr(tokenizer, attr_name, tokenizer.eod_id)
+
+        token_names = ["bos_token", "eos_token", "pad_token", "unk_token"]
+        for attr_name in token_names:
+            if getattr(tokenizer, attr_name) is None:
+                setattr(tokenizer, attr_name, "<|endoftext|>")
+
     if cfg.special_tokens:
         for k, val in cfg.special_tokens.items():
-            tokenizer.add_special_tokens({k: val})
+            tokenizer.add_special_tokens(
+                {k: AddedToken(val, rstrip=False, lstrip=False, normalized=False)}
+            )
+
+        # If we add bos_token and eos_token, we need to update the post processor to
+        # handle them correctly.
+        # https://github.com/huggingface/transformers/pull/24132
+        bos_or_eos_in_special_tokens = (
+            "bos_token" in cfg.special_tokens and "eos_token" in cfg.special_tokens
+        )
+        if (
+            tokenizer.__class__.__name__
+            in (
+                "LlamaTokenizerFast",
+                "CodeLlamaTokenizerFast",
+            )
+            and bos_or_eos_in_special_tokens
+        ):
+            tokenizer.update_post_processor()
+
     if cfg.tokens:
-        tokenizer.add_tokens(list(cfg.tokens))
+        tokenizer.add_tokens(
+            [
+                AddedToken(token, rstrip=False, lstrip=False, normalized=False)
+                for token in cfg.tokens
+            ]
+        )
+
+    LOG.debug(f"EOS: {tokenizer.eos_token_id} / {tokenizer.eos_token}")
+    LOG.debug(f"BOS: {tokenizer.bos_token_id} / {tokenizer.bos_token}")
+    LOG.debug(f"PAD: {tokenizer.pad_token_id} / {tokenizer.pad_token}")
+    LOG.debug(f"UNK: {tokenizer.unk_token_id} / {tokenizer.unk_token}")
 
     return tokenizer
 
@@ -99,20 +180,43 @@ def load_model(
     Load a model for a given configuration and tokenizer.
     """
     base_model = cfg.base_model
-    base_model_config = cfg.base_model_config
     model_type = cfg.model_type
+    model_config = load_model_config(cfg)
 
     # TODO refactor as a kwarg
     load_in_8bit = cfg.load_in_8bit
 
-    if cfg.is_llama_derived_model and cfg.flash_attention:
+    if hasattr(model_config, "model_type") and model_config.model_type == "btlm":
+        if cfg.flash_attention:
+            from axolotl.monkeypatch.btlm_attn_hijack_flash import (
+                replace_btlm_attn_with_flash_attn,
+            )
+
+            replace_btlm_attn_with_flash_attn(cfg.base_model)
+
+    if (
+        hasattr(model_config, "model_type")
+        and model_config.model_type == "stablelm_epoch"
+    ):
+        if cfg.flash_attention and cfg.sample_packing:
+            from axolotl.monkeypatch.stablelm_attn_hijack_flash import (
+                replace_stablelm_attn_with_flash_attn,
+            )
+
+            replace_stablelm_attn_with_flash_attn(cfg.base_model)
+
+    if cfg.is_llama_derived_model and cfg.flash_attention and cfg.sample_packing:
         if cfg.device not in ["mps", "cpu"] and not inference:
             from axolotl.monkeypatch.llama_attn_hijack_flash import (
                 replace_llama_attn_with_flash_attn,
             )
 
-            LOG.info("patching with flash attention")
-            replace_llama_attn_with_flash_attn(packed=cfg.sample_packing)
+            LOG.info("patching with flash attention for sample packing")
+            replace_llama_attn_with_flash_attn(
+                packed=cfg.sample_packing,
+                cross_entropy=cfg.flash_attn_cross_entropy,
+                rms_norm=cfg.flash_attn_rms_norm,
+            )
     elif cfg.is_llama_derived_model and cfg.xformers_attention:
         from axolotl.monkeypatch.llama_attn_hijack_xformers import (
             hijack_llama_attention,
@@ -137,6 +241,26 @@ def load_model(
         # Note: This might overwrite previous additional_special_tokens
         tokenizer.add_special_tokens({"additional_special_tokens": [MEM_TOKEN]})
 
+    if cfg.is_mistral_derived_model and cfg.flash_attention and cfg.sample_packing:
+        from axolotl.monkeypatch.mistral_attn_hijack_flash import (
+            replace_mistral_attn_with_flash_attn,
+        )
+
+        LOG.info("patching with flash attention")
+        replace_mistral_attn_with_flash_attn(packed=cfg.sample_packing)
+
+    if (
+        cfg.model_config_type == "mixtral"
+        and cfg.flash_attention
+        and cfg.sample_packing
+    ):
+        from axolotl.monkeypatch.mixtral import (
+            replace_mixtral_attn_with_multipack_flash_attn,
+        )
+
+        LOG.info("patching with flash attention")
+        replace_mixtral_attn_with_multipack_flash_attn()
+
     if cfg.is_llama_derived_model and cfg.xpos_rope:
         from axolotl.monkeypatch.xpos_rope_llama_monkey_patch import (
             replace_llama_rope_with_xpos_rope,
@@ -155,32 +279,25 @@ def load_model(
         LOG.info("patching _expand_mask")
         hijack_expand_mask()
 
-    try:
-        if cfg.gptq:
-            from alpaca_lora_4bit.monkeypatch.peft_tuners_lora_monkey_patch import (
-                replace_peft_model_with_int4_lora_model,
-            )
-
-            replace_peft_model_with_int4_lora_model()
-    except Exception as err:
-        LOG.exception(err)
-        raise err
-
-    if not cfg.gptq and (
-        (cfg.adapter == "lora" and load_in_8bit)
-        or (cfg.adapter == "qlora" and cfg.load_in_4bit)
-    ):
-        try:
-            from peft import prepare_model_for_kbit_training
-        except ImportError:
-            # For backward compatibility
-            from peft import (
-                prepare_model_for_int8_training as prepare_model_for_kbit_training,
-            )
-
     model_kwargs = {}
+
+    model_kwargs["device_map"] = cfg.device_map
+    model_kwargs["max_memory"] = cfg.max_memory
+    model_kwargs["torch_dtype"] = cfg.torch_dtype
+
     if cfg.model_revision:
         model_kwargs["revision"] = cfg.model_revision
+    if cfg.gptq:
+        if not hasattr(model_config, "quantization_config"):
+            LOG.warning("model config does not contain quantization_config information")
+        else:
+            if cfg.gptq_disable_exllama is not None:
+                model_config.quantization_config[
+                    "disable_exllama"
+                ] = cfg.gptq_disable_exllama
+            model_kwargs["quantization_config"] = GPTQConfig(
+                **model_config.quantization_config
+            )
     if cfg.adapter == "qlora" and cfg.load_in_4bit:
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -190,64 +307,49 @@ def load_model(
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-    try:
-        if cfg.gptq and cfg.is_llama_derived_model:
-            from alpaca_lora_4bit.autograd_4bit import load_llama_model_4bit_low_ram
-            from huggingface_hub import snapshot_download
+    # sample packing uses custom FA2 patch
+    if cfg.flash_attention:
+        if not cfg.sample_packing:
+            if (
+                cfg.is_llama_derived_model
+                or cfg.is_falcon_derived_model
+                or cfg.is_mistral_derived_model
+                or model_config.model_type == "mixtral"
+            ):
+                model_config._attn_implementation = (  # pylint: disable=protected-access
+                    "flash_attention_2"
+                )
+        else:
+            if model_config.model_type == "mixtral":
+                model_config._attn_implementation = (  # pylint: disable=protected-access
+                    "flash_attention_2"
+                )
 
-            try:
-                snapshot_download_kwargs = {}
-                if cfg.base_model_ignore_patterns:
-                    snapshot_download_kwargs[
-                        "ignore_patterns"
-                    ] = cfg.base_model_ignore_patterns
-                cache_model_path = Path(
-                    snapshot_download(base_model, **snapshot_download_kwargs)
-                )
-                files = (
-                    list(cache_model_path.glob("*.pt"))
-                    + list(cache_model_path.glob("*.safetensors"))
-                    + list(cache_model_path.glob("*.bin"))
-                )
-                if len(files) > 0:
-                    model_path = str(files[0])
-                else:
-                    LOG.warning(
-                        "unable to find a cached model file, this will likely fail..."
-                    )
-                    model_path = str(cache_model_path)
-            except Exception:  # pylint: disable=broad-exception-caught
-                model_path = cfg.base_model
-            model, _ = load_llama_model_4bit_low_ram(
-                base_model_config if base_model_config else base_model,
-                model_path,
-                device_map=cfg.device_map,
-                half=cfg.fp16,
-                groupsize=cfg.gptq_groupsize if cfg.gptq_groupsize else -1,
-                is_v1_model=cfg.gptq_model_v1
-                if cfg.gptq_model_v1 is not None
-                else True,
-            )
-            load_in_8bit = False
-        elif cfg.is_llama_derived_model and not cfg.trust_remote_code:
+    try:
+        if cfg.is_llama_derived_model and not cfg.trust_remote_code and not cfg.gptq:
             from transformers import LlamaForCausalLM
 
-            config_kwargs = {}
-            if cfg.rope_scaling:
-                config_kwargs["rope_scaling"] = cfg.rope_scaling
-            config = LlamaConfig.from_pretrained(
-                base_model_config,
-                **config_kwargs,
-            )
             model = LlamaForCausalLM.from_pretrained(
                 base_model,
-                config=config,
-                device_map=cfg.device_map,
+                config=model_config,
                 load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
                 load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
-                torch_dtype=cfg.torch_dtype,
                 **model_kwargs,
             )
+
+            if cfg.flash_attention and not inference:
+                from axolotl.monkeypatch.llama_attn_hijack_flash import (
+                    replace_llama_mlp_with_swiglu,
+                    replace_llama_qkv_with_fused,
+                )
+
+                if cfg.flash_attn_fuse_mlp:
+                    LOG.info("patching with SwiGLU")
+                    replace_llama_mlp_with_swiglu(model)
+
+                if cfg.flash_attn_fuse_qkv:
+                    LOG.info("patching with fused QKV")
+                    replace_llama_qkv_with_fused(model)
         # elif model_type == "GPTNeoXForCausalLM" and cfg.flash_attention:
         #     This is a WIP, still an issue with the backward pass
         #     RuntimeError: grad can be implicitly created only for scalar outputs
@@ -274,99 +376,154 @@ def load_model(
         #         device=cfg.device,
         #     )
         #     model.train() # sets to train instead of eval mode
-        elif model_type and not cfg.trust_remote_code:
-            model = getattr(transformers, model_type).from_pretrained(
+        elif model_type == "PhiForCausalLM":
+            from axolotl.models.phi import PhiForCausalLM
+
+            model = PhiForCausalLM.from_pretrained(
                 base_model,
-                device_map=cfg.device_map,
                 load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
                 load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
-                torch_dtype=cfg.torch_dtype,
-                trust_remote_code=cfg.trust_remote_code or False,
                 **model_kwargs,
             )
-        else:
-            config = AutoConfig.from_pretrained(
+        elif model_type == "MambaLMHeadModel":
+            # FIXME this is janky at best and hacked together to make it work
+            MambaLMHeadModel = fix_mamba_attn_for_loss()  # pylint: disable=invalid-name
+
+            model_kwargs["dtype"] = model_kwargs["torch_dtype"]
+            model_kwargs["device"] = torch.cuda.current_device()
+            del model_kwargs["torch_dtype"]
+            del model_kwargs["device_map"]
+            del model_kwargs["max_memory"]
+
+            model = MambaLMHeadModel.from_pretrained(
                 base_model,
-                trust_remote_code=cfg.trust_remote_code or False,
+                **model_kwargs,
             )
+        elif model_type and not cfg.trust_remote_code:
+            if cfg.gptq:
+                model = AutoModelForCausalLM.from_pretrained(
+                    base_model,
+                    config=model_config,
+                    trust_remote_code=cfg.trust_remote_code or False,
+                    **model_kwargs,
+                )
+            else:
+                model = getattr(transformers, model_type).from_pretrained(
+                    base_model,
+                    config=model_config,
+                    load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
+                    load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
+                    trust_remote_code=cfg.trust_remote_code or False,
+                    **model_kwargs,
+                )
+        else:
             # Shouldn't be a problem most of the time. will obviously error if the model doesn't support this
             # when training starts
             if (
-                hasattr(config, "max_seq_len")
-                and config.max_seq_len
-                and cfg.sequence_len > config.max_seq_len
+                hasattr(model_config, "max_seq_len")
+                and model_config.max_seq_len
+                and cfg.sequence_len > model_config.max_seq_len
             ):
-                config.max_seq_len = cfg.sequence_len
+                model_config.max_seq_len = cfg.sequence_len
                 LOG.warning(f"increasing context length to {cfg.sequence_len}")
             elif (
-                hasattr(config, "max_sequence_length")
-                and config.max_sequence_length
-                and cfg.sequence_len > config.max_sequence_length
+                hasattr(model_config, "max_sequence_length")
+                and model_config.max_sequence_length
+                and cfg.sequence_len > model_config.max_sequence_length
             ):
-                config.max_sequence_length = cfg.sequence_len
+                model_config.max_sequence_length = cfg.sequence_len
                 LOG.warning(f"increasing context length to {cfg.sequence_len}")
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                config=config,
-                device_map=cfg.device_map,
-                load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
-                load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
-                torch_dtype=cfg.torch_dtype,
-                trust_remote_code=cfg.trust_remote_code or False,
-                **model_kwargs,
-            )
+            if cfg.gptq:
+                model = AutoModelForCausalLM.from_pretrained(
+                    base_model,
+                    config=model_config,
+                    trust_remote_code=cfg.trust_remote_code or False,
+                    **model_kwargs,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    base_model,
+                    config=model_config,
+                    load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
+                    load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
+                    trust_remote_code=cfg.trust_remote_code or False,
+                    **model_kwargs,
+                )
     except Exception as err:  # pylint: disable=broad-exception-caught
-        LOG.error(
-            "Exception raised attempting to load model, retrying with AutoModelForCausalLM"
-        )
         LOG.exception(err)
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            device_map=cfg.device_map,
-            load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
-            load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
-            torch_dtype=cfg.torch_dtype,
-            trust_remote_code=cfg.trust_remote_code or False,
-            **model_kwargs,
-        )
+        raise err
 
     embeddings_len = (
         math.ceil(len(tokenizer) / 32) * 32
         if cfg.resize_token_embeddings_to_32x
         else len(tokenizer)
     )
-    model.resize_token_embeddings(embeddings_len)
+    if (
+        hasattr(model, "get_input_embeddings")
+        and model.get_input_embeddings().num_embeddings < embeddings_len
+    ):
+        model.resize_token_embeddings(embeddings_len)
+    else:
+        model.tie_weights()
 
     if (
-        hasattr(model.config, "max_position_embeddings")
+        hasattr(model, "config")
+        and hasattr(model.config, "max_position_embeddings")
         and model.config.max_position_embeddings
-        and cfg.sequence_len >= model.config.max_position_embeddings
+        and cfg.sequence_len > model.config.max_position_embeddings
     ):
         LOG.warning(
-            f"increasing model.config.max_position_embeddings to {cfg.sequence_len}"
+            f"increasing model.config.max_position_embeddings from {model.config.max_position_embeddings} to {cfg.sequence_len}"
         )
         model.config.max_position_embeddings = cfg.sequence_len
 
-    if model.device.type == "cuda":
+    if (
+        hasattr(model, "config")
+        and hasattr(model.config, "bos_token_id")
+        and model.config.bos_token_id
+        and model.config.bos_token_id != tokenizer.bos_token_id
+    ):
+        model.config.bos_token_id = tokenizer.bos_token_id
+
+    if (
+        hasattr(model, "config")
+        and hasattr(model.config, "eos_token_id")
+        and model.config.eos_token_id
+        and model.config.eos_token_id != tokenizer.eos_token_id
+    ):
+        model.config.eos_token_id = tokenizer.eos_token_id
+
+    if hasattr(model, "device") and model.device.type == "cuda":
         log_gpu_memory_usage(LOG, "after model load", model.device)
 
     # make sure these are fp32 per Ramesh et al. (2021)
     for name, module in model.named_modules():
         if "norm" in name:
             module.to(torch.float32)
+        if model_config.model_type == "btlm":
+            # don't upcast lm_head for btlm
+            continue
         if "lm_head" in name or "embed_tokens" in name:
             if hasattr(module, "weight"):
                 module.to(torch.float32)
 
     needs_fa2_dtype = cfg.adapter or cfg.fsdp
-    if not cfg.gptq and (
-        (cfg.adapter == "lora" and load_in_8bit)
-        or (cfg.adapter == "qlora" and cfg.load_in_4bit)
+    skip_prepare_model_for_kbit_training = False
+
+    if cfg.model_config_type == "qwen" and cfg.adapter == "lora":
+        # Qwen doesn't play nicely with LoRA if this is enabled
+        skip_prepare_model_for_kbit_training = True
+
+    if (cfg.adapter == "lora" and load_in_8bit) or (
+        cfg.adapter == "qlora" and cfg.load_in_4bit
     ):
         LOG.info("converting PEFT model w/ prepare_model_for_kbit_training")
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=cfg.gradient_checkpointing
-        )
+        if cfg.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+        if not skip_prepare_model_for_kbit_training:
+            model = prepare_model_for_kbit_training(
+                model, use_gradient_checkpointing=cfg.gradient_checkpointing
+            )
         needs_fa2_dtype = True
 
     # LlamaRMSNorm layers are in fp32 after kbit_training or full finetune, so we need to
@@ -385,26 +542,7 @@ def load_model(
     if cfg.ddp and not load_in_8bit:
         model.to(f"cuda:{cfg.local_rank}")
 
-    if cfg.gptq:
-        # Scales to half
-        LOG.info("Fitting 4bit scales and zeros to half")
-        for _, module in model.named_modules():
-            if "Autograd4bitQuantLinear" in str(type(module)) or "Linear4bitLt" in str(
-                type(module)
-            ):
-                if hasattr(module, "is_v1_model") and module.is_v1_model:
-                    module.zeros = module.zeros.half()
-                module.scales = module.scales.half()
-                module.bias = module.bias.half()
-
-    if (
-        torch.cuda.device_count() > 1
-        and int(os.getenv("WORLD_SIZE", "1")) > 1
-        and (cfg.gptq or cfg.load_in_4bit)
-    ):
-        # llama is PROBABLY model parallelizable, but the default isn't that it is
-        # so let's only set it for the 4bit, see
-        # https://github.com/johnsmith0031/alpaca_lora_4bit/blob/08b3fca4a4a9e0d3945be1bab4529f100a428636/finetune.py#L130-L133
+    if torch.cuda.device_count() > 1 and int(os.getenv("WORLD_SIZE", "1")) == 1:
         setattr(model, "is_parallelizable", True)
         setattr(model, "model_parallel", True)
 
@@ -414,7 +552,8 @@ def load_model(
             requires_grad.append(f"{name}: {param.requires_grad}")
     if len(requires_grad) == 0:
         LOG.warning("there are no parameters that require gradient updates")
-    model.config.use_cache = False
+    if hasattr(model, "config"):
+        model.config.use_cache = False
 
     if cfg.flash_optimum:
         model = BetterTransformer.transform(model)
@@ -467,10 +606,14 @@ def load_llama_adapter(model, cfg):
 
 
 def find_all_linear_names(model):
-    cls = (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt, torch.nn.Linear)
+    cls = (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt, torch.nn.Linear, QuantLinear)
     lora_module_names = set()
     for name, module in model.named_modules():
-        if isinstance(module, cls):
+        if (
+            isinstance(module, cls)
+            or "Linear" in module.__class__.__name__
+            and module.__class__.__name__ not in ("LlamaLinearScalingRotaryEmbedding",)
+        ):
             names = name.split(".")
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 

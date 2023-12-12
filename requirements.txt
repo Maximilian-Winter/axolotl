@@ -1,19 +1,22 @@
+--extra-index-url https://huggingface.github.io/autogptq-index/whl/cu118/
+auto-gptq==0.5.1
 packaging
-peft @ git+https://github.com/huggingface/peft.git
-transformers @ git+https://github.com/huggingface/transformers.git
+peft==0.6.0
+transformers @ git+https://github.com/huggingface/transformers.git@e5079b0b2abcef11ecbdae60ba4a6636c57b725d
+tokenizers==0.15.0
 bitsandbytes>=0.41.1
-accelerate @ git+https://github.com/huggingface/accelerate@2a289f6108e77a77a4efffb3f6316bc98538413b
+accelerate==0.24.1
+deepspeed
 addict
-evaluate
 fire
 PyYAML>=6.0
-datasets
-flash-attn>=2.0.8
+datasets>=2.15.0
+flash-attn==2.3.3
 sentencepiece
 wandb
 einops
-xformers
-optimum
+xformers==0.0.22
+optimum==1.13.2
 hf_transfer
 colorama
 numba
@@ -26,3 +29,11 @@ scipy
 scikit-learn==1.2.2
 pynvml
 art
+fschat==0.2.34
+gradio==3.50.2
+tensorboard
+
+# remote filesystems
+s3fs
+gcsfs
+# adlfs

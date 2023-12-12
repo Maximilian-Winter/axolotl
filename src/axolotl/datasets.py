@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 from datasets import Dataset, IterableDataset
@@ -22,7 +22,7 @@ class TokenizedPromptDataset(Dataset):
     """
     Dataset that returns tokenized prompts from a stream of text files.
         Args:
-            prompt_tokenizer (PromptTokenizingStrategy): The prompt tokenizing method for proccessing the data.
+            prompt_tokenizer (PromptTokenizingStrategy): The prompt tokenizing method for processing the data.
             dataset (dataset.Dataset): Dataset with text files.
     """
 
@@ -30,18 +30,29 @@ class TokenizedPromptDataset(Dataset):
         self,
         prompt_tokenizer: PromptTokenizingStrategy,
         dataset: IterableDataset,
+        process_count: Optional[int] = None,
         **kwargs,
     ):
         self.prompt_tokenizer = prompt_tokenizer
+        self.process_count = process_count
         super().__init__(self.process(dataset).data, **kwargs)
 
     def process(self, dataset):
         features = dataset.features.keys()
-        num_proc = min(64, os.cpu_count())
+        num_proc = (
+            min(64, self.process_count)
+            if self.process_count
+            else min(64, os.cpu_count())
+        )
+        map_kwargs = {}
+        if self.prompt_tokenizer.supports_batched:
+            map_kwargs["batched"] = True
+            map_kwargs["batch_size"] = 100
         return dataset.map(
             self.prompt_tokenizer.tokenize_prompt,
             num_proc=num_proc,
             remove_columns=features,
+            **map_kwargs,
         )
 
 
@@ -50,7 +61,7 @@ class ConstantLengthDataset(IterableDataset):
     """
     Iterable dataset that returns constant length chunks of tokens from stream of text files.
         Args:
-            tokenizer (Tokenizer): The processor used for proccessing the data.
+            tokenizer (Tokenizer): The processor used for processing the data.
             dataset (dataset.Dataset): Dataset with text files.
             seq_length (int): Length of token sequences to return.
     """
