@@ -9,7 +9,7 @@ def load_jsonl(filename):
     with open(filename, 'r') as file:
         return [json.loads(line) for line in file]
 
-dataset = load_jsonl('mingus_dataset_v3.jsonl')
+dataset = load_jsonl('mingus_dataset_v6.jsonl')
 
 
 count_deleted = 0
@@ -17,7 +17,7 @@ count_deleted = 0
 new_data = []
 for date in dataset:
     length = tokenizer(date['text'], return_tensors="pt").input_ids.cuda().shape[1]
-    if length <= 2048:
+    if length <= 4096:
         new_data.append(date)
     else:
         count_deleted += 1
@@ -30,4 +30,4 @@ def save_jsonl(data, filename):
         for item in data:
             file.write(json.dumps(item) + '\n')
 
-save_jsonl(new_data, "mingus_dataset_v3.jsonl")
+save_jsonl(new_data, "mingus_dataset_v6-cleaned.jsonl")

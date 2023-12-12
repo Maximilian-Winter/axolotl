@@ -9,13 +9,13 @@ load_in_4bit: true
 strict: false
 
 datasets:
-  - path: custom/mingus/mingus_dataset_v3.jsonl # or json
+  - path: ./custom/mingus/mingus_dataset_v5.jsonl
     ds_type: json # see other options below
     type: mingus.load_mingus
 
 dataset_prepared_path: last_run_prepared
 val_set_size: 0.01
-output_dir: ./qlora-out-mingus-13b-v3
+output_dir: ./qlora-out-mingus-13b-v4
 
 adapter: qlora
 lora_model_dir:
@@ -43,18 +43,18 @@ wandb_watch:
 wandb_run_id:
 wandb_log_model:
 
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 2
 micro_batch_size: 1
 num_epochs: 1
 optimizer: paged_adamw_32bit
-lr_scheduler: constant
-learning_rate: 0.00004
+lr_scheduler: cosine
+learning_rate: 0.0002
 
 train_on_inputs: false
 group_by_length: false
 bf16: true
 fp16: false
-tf32: false
+tf32: true
 
 gradient_checkpointing: true
 early_stopping_patience:

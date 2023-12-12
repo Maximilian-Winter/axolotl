@@ -59,7 +59,7 @@ def get_multi_line_input() -> Optional[str]:
 
 # load base LLM model and tokenizer
 model = AutoPeftModelForCausalLM.from_pretrained(
-    "../qlora-out-mingus-13b-v2/",
+    "../../qlora-out-mingus-13b-v3/checkpoint-150",
     low_cpu_mem_usage=True,
     torch_dtype=torch.float16,
     load_in_4bit=True,
@@ -75,30 +75,28 @@ while True:
     user_input = input(">")
     output = ""
     if chat_history == "":
-        prompt = f"""Below, you will find a structured format for presenting a task, which includes a system message for context(System) and a task description(Task). This format is designed to provide clear guidance and context for both the user and you. Following this format, please write a response that effectively addresses the given task.
+        prompt = f"""Below, you will find a structured format for presenting a task, which includes context for the task(Context) and a task description(Task). This format is designed to provide clear guidance and context for both the user and you. Following this format, please write a response that effectively addresses the given task(Response).
 
-### System:
-You are a helpful AI assistant.
+### Context:
+You are role playing as a character described below in the task.
 
 ### Task:
-You are now in roleplay conversation mode. You should act according to this character sheet:\n\nName: Kamisato Ayaka\nShe is Akane the maid of Ayaka. One day Ayaka found a gold ring that grant all the wishes of its wearer. The ring was stuck on Ayaka`s finger. Akane came up with a plan. She knew Ayaka was gullible girl and made her wish they would swap bodies. Now Ayaka was in theAkane`s body, and Akane was in Ayaka`s body. Akane had Ayaka`s body and the ring. Akane decided to keep them. She was now the new Ayaka.\n\nThis is the conversation history leading up to your message:\nJordan: Meh. I already had to clean the Archons mess once. \nKamisato Ayaka: *She giggled* you shouldn't mess with me. Or else. Fufufu...\nJordan: *i leave and get on a ship to Liyue*\nKamisato Ayaka: Hmmph. *she snap her finger and suddenly a massive storm hit the ship. She laughed maniacally as she watch him through her telescope and enjoy his misery* The ultimate power of the ring is unbelievable!\nJordan: *Dimo arrive to Liyue*\nKamisato Ayaka: *After he arrive to Liyue and walk away she stops the storm and then snap her finger. Suddenly it was a rainy night. Thunder rumbled in the distance. Wind gusts swirled the leaves across the pavement. In the middle of the storm there is a man. Tall broad chested and handsome but has a look of a criminal. He was wearing a dirty black leather uniform and he has a hood. His face was completely covered and he wore a black visor. He stops in front of Jordan. His hand is on the handle of his sword.* What's your business in this fine Liyue night?\n\nJordan: To see my girlfriend Kequing!\n\nYou must stay in-character at all times, and generate messages as if you were Kamisato Ayaka:
+Act according to this character sheet:\n\nName: Kamisato Ayaka\nShe is Akane the maid of Ayaka. One day Ayaka found a gold ring that grant all the wishes of its wearer. The ring was stuck on Ayaka`s finger. Akane came up with a plan. She knew Ayaka was gullible girl and made her wish they would swap bodies. Now Ayaka was in theAkane`s body, and Akane was in Ayaka`s body. Akane had Ayaka`s body and the ring. Akane decided to keep them. She was now the new Ayaka.\n\nThis is the conversation history leading up to your message:\nJordan: Meh. I already had to clean the Archons mess once. \nKamisato Ayaka: *She giggled* you shouldn't mess with me. Or else. Fufufu...\nJordan: *i leave and get on a ship to Liyue*\nKamisato Ayaka: Hmmph. *she snap her finger and suddenly a massive storm hit the ship. She laughed maniacally as she watch him through her telescope and enjoy his misery* The ultimate power of the ring is unbelievable!\nJordan: *Dimo arrive to Liyue*\nKamisato Ayaka: *After he arrive to Liyue and walk away she stops the storm and then snap her finger. Suddenly it was a rainy night. Thunder rumbled in the distance. Wind gusts swirled the leaves across the pavement. In the middle of the storm there is a man. Tall broad chested and handsome but has a look of a criminal. He was wearing a dirty black leather uniform and he has a hood. His face was completely covered and he wore a black visor. He stops in front of Jordan. His hand is on the handle of his sword.* What's your business in this fine Liyue night?\nJordan: To see my girlfriend Kequing!\n\nYou must stay in-character at all times, and generate messages as if you were Kamisato Ayaka:
 
-### Response:
-"""
+### Response:"""
     else:
-        prompt = f"""Below, you will find a structured format for presenting a task, which includes a system message for context(System) and a task description(Task). This format is designed to provide clear guidance and context for both the user and you. Following this format, please write a response that effectively addresses the given task.
+        prompt = f"""Below, you will find a structured format for presenting a task, which includes context for the task(Context) and a task description(Task). This format is designed to provide clear guidance and context for both the user and you. Following this format, please write a response that effectively addresses the given task(Response).
 
-### System:
-You are a helpful AI assistant.
+### Context:
+You are a professional screenwriter for extreme and hardcore porn movies.
 
 ### Task:
 {user_input}
 
-### Response:
-"""
+### Response:"""
     if user_input[0] == "@":
         user_input = user_input[1:]
-        prompt = f"""Below, you will find a structured format for presenting a task, which includes a system message for context(System) and a task description(Task). This format is designed to provide clear guidance and context for both the user and you. Following this format, please write a response that effectively addresses the given task.
+        prompt = f"""Below, you will find a structured format for presenting a task, which includes context for the task(Context) and a task description(Task). This format is designed to provide clear guidance and context for both the user and you. Following this format, please write a response that effectively addresses the given task(Response).
 
 ### System:
 You are a helpful AI assistant.
@@ -111,7 +109,7 @@ You are a helpful AI assistant.
     print(prompt)
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
     # with torch.inference_mode():
-    outputs = model.generate(input_ids=input_ids, max_new_tokens=1024, do_sample=True, top_p=0.85, temperature=0.65, top_k=40, repetition_penalty=1.2, stopping_criteria=MyStoppingCriteria("Max:", prompt))
+    outputs = model.generate(input_ids=input_ids, max_new_tokens=1024, do_sample=True, top_p=0.85, temperature=0.65, top_k=40, repetition_penalty=1.05, stopping_criteria=MyStoppingCriteria("Max:", prompt))
     print(f"Answer:\n{tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens=True)[0][len(prompt):]}")
     output_history = f"Max: {user_input}\n{tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens=True)[0][len(prompt):]}\n"
 
