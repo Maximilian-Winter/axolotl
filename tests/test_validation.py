@@ -6,15 +6,17 @@ import unittest
 from typing import Optional
 
 import pytest
+from transformers.utils import is_torch_bf16_gpu_available
 
 from axolotl.utils.config import validate_config
 from axolotl.utils.dict import DictDefault
+from axolotl.utils.models import check_model_config
 from axolotl.utils.wandb_ import setup_wandb_env_vars
 
 
-class ValidationTest(unittest.TestCase):
+class BaseValidation(unittest.TestCase):
     """
-    Test the validation module
+    Base validation module to setup the log capture
     """
 
     _caplog: Optional[pytest.LogCaptureFixture] = None
@@ -23,15 +25,12 @@ class ValidationTest(unittest.TestCase):
     def inject_fixtures(self, caplog):
         self._caplog = caplog
 
-    def test_load_4bit_deprecate(self):
-        cfg = DictDefault(
-            {
-                "load_4bit": True,
-            }
-        )
 
-        with pytest.raises(ValueError):
-            validate_config(cfg)
+# pylint: disable=too-many-public-methods
+class ValidationTest(BaseValidation):
+    """
+    Test the validation module
+    """
 
     def test_batch_size_unused_warning(self):
         cfg = DictDefault(
@@ -316,20 +315,19 @@ class ValidationTest(unittest.TestCase):
 
         validate_config(cfg)
 
-    def test_packing(self):
+    def test_deprecated_packing(self):
         cfg = DictDefault(
             {
-                "max_packed_sequence_len": 2048,
+                "max_packed_sequence_len": 1024,
             }
         )
-        with self._caplog.at_level(logging.WARNING):
+        with pytest.raises(
+            DeprecationWarning,
+            match=r"`max_packed_sequence_len` is no longer supported",
+        ):
             validate_config(cfg)
-            assert any(
-                "max_packed_sequence_len will be deprecated in favor of sample_packing"
-                in record.message
-                for record in self._caplog.records
-            )
 
+    def test_packing(self):
         cfg = DictDefault(
             {
                 "sample_packing": True,
@@ -344,16 +342,10 @@ class ValidationTest(unittest.TestCase):
                 for record in self._caplog.records
             )
 
-        cfg = DictDefault(
-            {
-                "max_packed_sequence_len": 2048,
-                "sample_packing": True,
-            }
-        )
-        regex_exp = r".*set only one of max_packed_sequence_len \(deprecated soon\) or sample_packing.*"
-        with pytest.raises(ValueError, match=regex_exp):
-            validate_config(cfg)
-
+    @pytest.mark.skipif(
+        is_torch_bf16_gpu_available(),
+        reason="test should only run on gpus w/o bf16 support",
+    )
     def test_merge_lora_no_bf16_fail(self):
         """
         This is assumed to be run on a CPU machine, so bf16 is not supported.
@@ -682,8 +674,121 @@ class ValidationTest(unittest.TestCase):
 
         validate_config(cfg)
 
+    def test_unfrozen_parameters_w_peft_layers_to_transform(self):
+        cfg = DictDefault(
+            {
+                "adapter": "lora",
+                "unfrozen_parameters": ["model.layers.2[0-9]+.block_sparse_moe.gate.*"],
+                "peft_layers_to_transform": [0, 1],
+            }
+        )
 
-class ValidationWandbTest(ValidationTest):
+        with pytest.raises(
+            ValueError,
+            match=r".*can have unexpected behavior*",
+        ):
+            validate_config(cfg)
+
+    def test_hub_model_id_save_value_warns(self):
+        cfg = DictDefault({"hub_model_id": "test"})
+
+        with self._caplog.at_level(logging.WARNING):
+            validate_config(cfg)
+            assert (
+                "set without any models being saved" in self._caplog.records[0].message
+            )
+
+    def test_hub_model_id_save_value(self):
+        cfg = DictDefault({"hub_model_id": "test", "saves_per_epoch": 4})
+
+        with self._caplog.at_level(logging.WARNING):
+            validate_config(cfg)
+            assert len(self._caplog.records) == 0
+
+
+class ValidationCheckModelConfig(BaseValidation):
+    """
+    Test the validation for the config when the model config is available
+    """
+
+    def test_llama_add_tokens_adapter(self):
+        cfg = DictDefault(
+            {"adapter": "qlora", "load_in_4bit": True, "tokens": ["<|imstart|>"]}
+        )
+        model_config = DictDefault({"model_type": "llama"})
+
+        with pytest.raises(
+            ValueError,
+            match=r".*`lora_modules_to_save` not properly set when adding new tokens*",
+        ):
+            check_model_config(cfg, model_config)
+
+        cfg = DictDefault(
+            {
+                "adapter": "qlora",
+                "load_in_4bit": True,
+                "tokens": ["<|imstart|>"],
+                "lora_modules_to_save": ["embed_tokens"],
+            }
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r".*`lora_modules_to_save` not properly set when adding new tokens*",
+        ):
+            check_model_config(cfg, model_config)
+
+        cfg = DictDefault(
+            {
+                "adapter": "qlora",
+                "load_in_4bit": True,
+                "tokens": ["<|imstart|>"],
+                "lora_modules_to_save": ["embed_tokens", "lm_head"],
+            }
+        )
+
+        check_model_config(cfg, model_config)
+
+    def test_phi_add_tokens_adapter(self):
+        cfg = DictDefault(
+            {"adapter": "qlora", "load_in_4bit": True, "tokens": ["<|imstart|>"]}
+        )
+        model_config = DictDefault({"model_type": "phi"})
+
+        with pytest.raises(
+            ValueError,
+            match=r".*`lora_modules_to_save` not properly set when adding new tokens*",
+        ):
+            check_model_config(cfg, model_config)
+
+        cfg = DictDefault(
+            {
+                "adapter": "qlora",
+                "load_in_4bit": True,
+                "tokens": ["<|imstart|>"],
+                "lora_modules_to_save": ["embd.wte", "lm_head.linear"],
+            }
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r".*`lora_modules_to_save` not properly set when adding new tokens*",
+        ):
+            check_model_config(cfg, model_config)
+
+        cfg = DictDefault(
+            {
+                "adapter": "qlora",
+                "load_in_4bit": True,
+                "tokens": ["<|imstart|>"],
+                "lora_modules_to_save": ["embed_tokens", "lm_head"],
+            }
+        )
+
+        check_model_config(cfg, model_config)
+
+
+class ValidationWandbTest(BaseValidation):
     """
     Validation test for wandb
     """
@@ -741,6 +846,15 @@ class ValidationWandbTest(ValidationTest):
         assert os.environ.get("WANDB_LOG_MODEL", "") == "checkpoint"
         assert os.environ.get("WANDB_DISABLED", "") != "true"
 
+        os.environ.pop("WANDB_PROJECT", None)
+        os.environ.pop("WANDB_NAME", None)
+        os.environ.pop("WANDB_RUN_ID", None)
+        os.environ.pop("WANDB_ENTITY", None)
+        os.environ.pop("WANDB_MODE", None)
+        os.environ.pop("WANDB_WATCH", None)
+        os.environ.pop("WANDB_LOG_MODEL", None)
+        os.environ.pop("WANDB_DISABLED", None)
+
     def test_wandb_set_disabled(self):
         cfg = DictDefault({})
 
@@ -761,3 +875,6 @@ class ValidationWandbTest(ValidationTest):
         setup_wandb_env_vars(cfg)
 
         assert os.environ.get("WANDB_DISABLED", "") != "true"
+
+        os.environ.pop("WANDB_PROJECT", None)
+        os.environ.pop("WANDB_DISABLED", None)

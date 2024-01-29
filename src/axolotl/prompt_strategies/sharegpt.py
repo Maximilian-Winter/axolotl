@@ -6,16 +6,19 @@ from fastchat.conversation import Conversation, SeparatorStyle, register_conv_te
 from axolotl.prompt_tokenizers import ShareGPTPromptTokenizingStrategy
 from axolotl.prompters import ShareGPTPrompterV2
 
-register_conv_template(
-    Conversation(
-        name="chatml",
-        system_template="<|im_start|>system\n{system_message}",
-        system_message="You are a helpful assistant.",
-        roles=["<|im_start|>user", "<|im_start|>assistant"],
-        sep_style=SeparatorStyle.CHATML,
-        sep="<|im_end|>",
+
+def register_chatml_template(system_message=None):
+    system_message = system_message or "You are a helpful assistant."
+    register_conv_template(
+        Conversation(
+            name="chatml",
+            system_template="<|im_start|>system\n{system_message}",
+            system_message=system_message,
+            roles=["<|im_start|>user", "<|im_start|>assistant"],
+            sep_style=SeparatorStyle.CHATML,
+            sep="<|im_end|>",
+        )
     )
-)
 
 
 def load(tokenizer, cfg, ds_cfg: Optional[Dict[str, Any]] = None):
@@ -29,6 +32,23 @@ def load(tokenizer, cfg, ds_cfg: Optional[Dict[str, Any]] = None):
             conversation=conversation,
             role_key_model=field_model,
             role_key_human=field_human,
+        ),
+        tokenizer,
+        cfg.train_on_inputs,
+        cfg.sequence_len,
+    )
+    if ds_cfg and "strict" in ds_cfg:
+        strategy.strict = ds_cfg["strict"]
+    return strategy
+
+
+def load_ultrachat(tokenizer, cfg, ds_cfg: Optional[Dict[str, Any]] = None):
+    conversation = (
+        ds_cfg["conversation"] if ds_cfg and "conversation" in ds_cfg else None
+    )
+    strategy = UltrachatShareGPTPromptTokenizingStrategy(
+        ShareGPTPrompterV2(
+            conversation=conversation,
         ),
         tokenizer,
         cfg.train_on_inputs,
@@ -107,5 +127,19 @@ class GuanacoShareGPTPromptTokenizingStrategy(ShareGPTPromptTokenizingStrategy):
         role_map = {"prompter": "human", "assistant": "gpt"}
         turns = [
             {"from": role_map[t["role"]], "value": t["text"]} for t in conversations
+        ]
+        return turns
+
+
+class UltrachatShareGPTPromptTokenizingStrategy(SimpleShareGPTPromptTokenizingStrategy):
+    """
+    sharegpt strategy that remaps ultrachat data to sharegpt format
+    """
+
+    def get_conversation_thread(self, prompt):
+        conversations = prompt["messages"]
+        role_map = {"user": "human", "assistant": "gpt"}
+        turns = [
+            {"from": role_map[t["role"]], "value": t["content"]} for t in conversations
         ]
         return turns
