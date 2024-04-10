@@ -2,6 +2,7 @@
 configs
 last_run_prepared/
 .vscode
+_site/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -167,3 +168,10 @@ cython_debug/
 # WandB
 # wandb creates a folder to store logs for training runs
 wandb
+
+# Runs
+lora-out/*
+qlora-out/*
+mlruns/*
+
+/.quarto/

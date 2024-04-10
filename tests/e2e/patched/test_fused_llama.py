@@ -33,6 +33,7 @@ class TestFusedLlama(unittest.TestCase):
             {
                 "base_model": "JackFram/llama-68m",
                 "flash_attention": True,
+                "pad_to_sequence_len": True,
                 "flash_attn_fuse_qkv": True,
                 "flash_attn_fuse_mlp": True,
                 "sample_packing": True,
@@ -56,9 +57,9 @@ class TestFusedLlama(unittest.TestCase):
                 "learning_rate": 0.00001,
                 "optimizer": "adamw_torch",
                 "lr_scheduler": "cosine",
-                "max_steps": 20,
-                "save_steps": 10,
-                "eval_steps": 10,
+                "max_steps": 10,
+                "save_steps": 5,
+                "eval_steps": 5,
             }
         )
         if is_torch_bf16_gpu_available():

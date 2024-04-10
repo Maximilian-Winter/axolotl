@@ -3,6 +3,7 @@ CLI to run training on a model
 """
 import logging
 from pathlib import Path
+from typing import Union
 
 import fire
 import transformers
@@ -23,7 +24,7 @@ from axolotl.prompt_strategies.sharegpt import register_chatml_template
 LOG = logging.getLogger("axolotl.cli.preprocess")
 
 
-def do_cli(config: Path = Path("examples/"), **kwargs):
+def do_cli(config: Union[Path, str] = Path("examples/"), **kwargs):
     # pylint: disable=duplicate-code
     print_axolotl_text_art()
     parsed_cfg = load_cfg(config, **kwargs)
@@ -53,7 +54,7 @@ def do_cli(config: Path = Path("examples/"), **kwargs):
         LOG.warning(msg)
         parsed_cfg.dataset_prepared_path = DEFAULT_DATASET_PREPARED_PATH
 
-    if parsed_cfg.rl:
+    if parsed_cfg.rl and parsed_cfg.rl != "orpo":
         load_rl_datasets(cfg=parsed_cfg, cli_args=parsed_cli_args)
     else:
         load_datasets(cfg=parsed_cfg, cli_args=parsed_cli_args)

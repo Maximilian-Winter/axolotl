@@ -16,12 +16,12 @@ output_dir: ./qlora-out
 
 ## You can optionally freeze the entire model and unfreeze a subset of parameters
 unfrozen_parameters:
-#  - lm_head.*
-#  - model.embed_tokens.*
-#  - model.layers.2[0-9]+.block_sparse_moe.gate.*
-#  - model.layers.2[0-9]+.block_sparse_moe.experts.*
-#  - model.layers.3[0-9]+.block_sparse_moe.gate.*
-#  - model.layers.3[0-9]+.block_sparse_moe.experts.*
+#  - ^lm_head.weight$
+#  - ^model.embed_tokens.weight$[:32000]
+#  - model.layers.2[0-9]+.block_sparse_moe.gate
+#  - model.layers.2[0-9]+.block_sparse_moe.experts
+#  - model.layers.3[0-9]+.block_sparse_moe.gate
+#  - model.layers.3[0-9]+.block_sparse_moe.experts
 
 model_config:
   output_router_logits: true
@@ -81,7 +81,7 @@ loss_watchdog_patience: 3
 warmup_steps: 10
 evals_per_epoch: 4
 eval_table_size:
-eval_table_max_new_tokens: 128
+eval_max_new_tokens: 128
 saves_per_epoch: 1
 debug:
 deepspeed: deepspeed_configs/zero2.json

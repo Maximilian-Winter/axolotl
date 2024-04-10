@@ -1,16 +1,27 @@
 """Module for models and model loading"""
+# pylint: disable=too-many-lines
+
 import logging
 import math
 import os
+import types
 from typing import Any, Dict, Optional, Tuple, Union  # noqa: F401
 
 import addict
 import bitsandbytes as bnb
 import torch
 import transformers
-from optimum.bettertransformer import BetterTransformer
-from peft import LoftQConfig, PeftConfig, prepare_model_for_kbit_training
+from accelerate import init_empty_weights
+from bitsandbytes.nn import Params4bit
+from peft import (
+    LoftQConfig,
+    PeftConfig,
+    PeftModel,
+    PeftModelForCausalLM,
+    prepare_model_for_kbit_training,
+)
 from peft.tuners.lora import QuantLinear
+from torch import nn
 from transformers import (  # noqa: F401
     AddedToken,
     AutoConfig,
@@ -24,10 +35,15 @@ from transformers import (  # noqa: F401
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
 from axolotl.models.mamba import fix_mamba_attn_for_loss
+from axolotl.monkeypatch.multipack import (
+    SUPPORTED_MULTIPACK_MODEL_TYPES,
+    patch_for_multipack,
+)
 from axolotl.prompt_tokenizers import LLAMA_DEFAULT_EOS_TOKEN
 from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.chat_templates import chat_templates
 from axolotl.utils.dict import DictDefault
+from axolotl.utils.distributed import zero_only
 from axolotl.utils.lora_embeddings import get_linear_embedding_layers
 
 LOG = logging.getLogger("axolotl")
@@ -77,8 +93,8 @@ def load_model_config(cfg):
         model_config_name = cfg.tokenizer_config
     trust_remote_code = cfg.trust_remote_code is True
     config_kwargs = {}
-    if cfg.model_revision:
-        config_kwargs["revision"] = cfg.model_revision
+    if cfg.revision_of_model:
+        config_kwargs["revision"] = cfg.revision_of_model
 
     try:
         model_config = AutoConfig.from_pretrained(
@@ -95,8 +111,8 @@ def load_model_config(cfg):
             )
         raise err
 
-    if cfg.model_config:
-        for key, val in cfg.model_config.items():
+    if cfg.overrides_of_model_config:
+        for key, val in cfg.overrides_of_model_config.items():
             setattr(model_config, key, val)
 
     check_model_config(cfg, model_config)
@@ -119,9 +135,8 @@ def load_tokenizer(cfg):
     if cfg.tokenizer_type:
         tokenizer_cls = getattr(transformers, cfg.tokenizer_type)
 
-    tokenizer_config = cfg.tokenizer_config or cfg.base_model_config or cfg.base_model
     tokenizer = tokenizer_cls.from_pretrained(
-        tokenizer_config,
+        cfg.tokenizer_config,
         trust_remote_code=cfg.trust_remote_code or False,
         use_fast=use_fast,
         **tokenizer_kwargs,
@@ -161,15 +176,20 @@ def load_tokenizer(cfg):
             if getattr(tokenizer, attr_name) is None:
                 setattr(tokenizer, attr_name, "<|endoftext|>")
 
+    additional_special_tokens = None
     if cfg.special_tokens:
+        special_tokens = cfg.special_tokens.to_dict()
+        additional_special_tokens = special_tokens.pop(
+            "additional_special_tokens", None
+        )
         lora_modules_to_save = get_linear_embedding_layers(model_config.model_type)
-        for k, val in cfg.special_tokens.items():
+        for k, val in special_tokens.items():
             # check if new special token is not already in tokenizer and
             # is adapter training to make sure lora_modules_to_save is set
             # pylint: disable=too-many-boolean-expressions
             if (
                 (getattr(tokenizer, k) is None or getattr(tokenizer, k) != val)
-                and (len(tokenizer.encode(val)) > 1)
+                and (len(tokenizer.encode(val, add_special_tokens=False)) > 2)
                 and cfg.adapter
                 and (
                     not cfg.lora_modules_to_save
@@ -213,10 +233,26 @@ def load_tokenizer(cfg):
             ]
         )
 
-    LOG.debug(f"EOS: {tokenizer.eos_token_id} / {tokenizer.eos_token}")
-    LOG.debug(f"BOS: {tokenizer.bos_token_id} / {tokenizer.bos_token}")
-    LOG.debug(f"PAD: {tokenizer.pad_token_id} / {tokenizer.pad_token}")
-    LOG.debug(f"UNK: {tokenizer.unk_token_id} / {tokenizer.unk_token}")
+    # Additional special tokens are a List, and need to be treated differently than regular special
+    # tokens. We add them after we have called `add_tokens` in case these additional special tokens
+    # are new tokens.
+    #
+    # Usage:
+    #
+    # ```py
+    # special_tokens:
+    #   additional_special_tokens: ["<|im_start|>", "<|im_end|>"]
+    # ```
+    if additional_special_tokens is not None:
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": additional_special_tokens}
+        )
+
+    with zero_only():
+        LOG.debug(f"EOS: {tokenizer.eos_token_id} / {tokenizer.eos_token}")
+        LOG.debug(f"BOS: {tokenizer.bos_token_id} / {tokenizer.bos_token}")
+        LOG.debug(f"PAD: {tokenizer.pad_token_id} / {tokenizer.pad_token}")
+        LOG.debug(f"UNK: {tokenizer.unk_token_id} / {tokenizer.unk_token}")
 
     if cfg.chat_template:
         chat_template_string = chat_templates(cfg.chat_template)
@@ -243,7 +279,7 @@ def load_model(
     Load a model for a given configuration and tokenizer.
     """
     base_model = cfg.base_model
-    model_type = cfg.model_type
+    model_type = cfg.type_of_model
     model_config = load_model_config(cfg)
 
     # TODO refactor as a kwarg
@@ -274,8 +310,15 @@ def load_model(
         shifted-sparse attention does not currently support sample packing."
         )
 
-    # Modify all llama derived models in one block
-    if cfg.is_llama_derived_model:
+    if (
+        cfg.model_config_type in SUPPORTED_MULTIPACK_MODEL_TYPES
+        and cfg.flash_attention
+        and cfg.sample_packing
+    ):
+        patch_for_multipack(cfg.model_config_type, model_name=cfg.base_model)
+    elif cfg.is_llama_derived_model:
+        # Modify all llama derived models in one block
+
         if cfg.flash_attention:
             from axolotl.monkeypatch.llama_attn_hijack_flash import (
                 replace_llama_attn_with_flash_attn,
@@ -304,13 +347,13 @@ def load_model(
 
             LOG.info("patching with xformers attention")
             hijack_llama_attention()
-        elif cfg.sdp_attention:
-            from axolotl.monkeypatch.llama_attn_hijack_sdp import (
-                hijack_llama_sdp_attention,
+        elif cfg.sample_packing:
+            from axolotl.monkeypatch.llama_patch_multipack import (
+                hijack_llama_prepare_4d_mask,
             )
 
-            LOG.info("patching with sdp attention")
-            hijack_llama_sdp_attention()
+            LOG.info("patching llama _prepare_4d_causal_attention_mask*")
+            hijack_llama_prepare_4d_mask()
         elif cfg.s2_attention:
             raise NotImplementedError(
                 "Shifted-sparse attention not currently implemented without flash attention."
@@ -329,43 +372,6 @@ def load_model(
         LOG.info("patching mistral with flash attention")
         replace_mistral_attn_with_flash_attn(packed=cfg.sample_packing)
 
-    if (
-        cfg.model_config_type == "mixtral"
-        and cfg.flash_attention
-        and cfg.sample_packing
-    ):
-        from axolotl.monkeypatch.mixtral import (
-            replace_mixtral_attn_with_multipack_flash_attn,
-        )
-
-        LOG.info("patching mixtral with flash attention")
-        mixtral_patch_kwargs = {}
-        if is_deepspeed_zero3_enabled():
-            mixtral_patch_kwargs["for_zero3"] = True
-        replace_mixtral_attn_with_multipack_flash_attn(**mixtral_patch_kwargs)
-
-    if cfg.model_config_type == "falcon" and cfg.flash_attention and cfg.sample_packing:
-        from axolotl.monkeypatch.falcon import (
-            replace_falcon_attn_with_multipack_flash_attn,
-        )
-
-        LOG.info("patching falcon with flash attention")
-        replace_falcon_attn_with_multipack_flash_attn()
-
-    if cfg.model_config_type == "phi" and cfg.flash_attention and cfg.sample_packing:
-        from axolotl.monkeypatch.phi import replace_phi_attn_with_multipack_flash_attn
-
-        LOG.info("patching phi with flash attention")
-        replace_phi_attn_with_multipack_flash_attn()
-
-    if cfg.model_config_type == "qwen2" and cfg.flash_attention and cfg.sample_packing:
-        from axolotl.monkeypatch.qwen2 import (
-            replace_qwen2_attn_with_multipack_flash_attn,
-        )
-
-        LOG.info("patching qwen2 with flash attention")
-        replace_qwen2_attn_with_multipack_flash_attn()
-
     if cfg.is_llama_derived_model and cfg.sample_packing and not inference:
         from axolotl.monkeypatch.llama_expand_mask import hijack_expand_mask
 
@@ -375,7 +381,7 @@ def load_model(
     model_kwargs: Dict[str, Any] = {}
 
     if cfg.model_kwargs:
-        for key, val in model_kwargs.items():
+        for key, val in cfg.model_kwargs.items():
             model_kwargs[key] = val
 
     max_memory = cfg.max_memory
@@ -395,10 +401,12 @@ def load_model(
 
     if max_memory is not None:
         # Based on https://github.com/togethercomputer/OpenChatKit/blob/main/inference/bot.py
-        from accelerate import infer_auto_device_map, init_empty_weights
+        from accelerate import infer_auto_device_map
 
         with init_empty_weights():
-            model_canvas = AutoModelForCausalLM.from_config(model_config)
+            model_canvas = AutoModelForCausalLM.from_config(
+                model_config, trust_remote_code=cfg.trust_remote_code or False
+            )
         model_canvas.tie_weights()
         device_map = infer_auto_device_map(
             model_canvas,
@@ -410,6 +418,10 @@ def load_model(
 
     model_kwargs["device_map"] = device_map
     model_kwargs["torch_dtype"] = cfg.torch_dtype
+
+    if torch.backends.mps.is_available():
+        model_kwargs["device_map"] = "mps:0"
+
     # TODO can we put the reference model on it's own gpu? I think we have to move logits around to calculate loss
     # if cfg.rl:
     #     if torch.cuda.device_count() > 1:
@@ -423,8 +435,9 @@ def load_model(
     if is_deepspeed_zero3_enabled():
         del model_kwargs["device_map"]
 
-    if cfg.model_revision:
-        model_kwargs["revision"] = cfg.model_revision
+    if cfg.revision_of_model:
+        model_kwargs["revision"] = cfg.revision_of_model
+
     if cfg.gptq:
         if not hasattr(model_config, "quantization_config"):
             LOG.warning("model config does not contain quantization_config information")
@@ -444,7 +457,12 @@ def load_model(
             "bnb_4bit_compute_dtype": cfg.torch_dtype,
             "bnb_4bit_use_double_quant": True,
             "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_quant_storage": torch.bfloat16,
         }
+        if not cfg.deepspeed:
+            # for some reason, this causes the loss to be off by an order of magnitude
+            # but deepspeed needs this still in bfloat16
+            bnb_config["bnb_4bit_quant_storage"] = torch.float32
 
         if cfg.bnb_config_kwargs:
             bnb_config.update(cfg.bnb_config_kwargs)
@@ -452,6 +470,18 @@ def load_model(
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             **bnb_config,
         )
+
+    if cfg.load_in_8bit and cfg.adapter is not None:
+        model_kwargs["load_in_8bit"] = True
+    if cfg.load_in_4bit and cfg.adapter is not None:
+        model_kwargs["load_in_4bit"] = True
+
+    # no longer needed per https://github.com/huggingface/transformers/pull/26610
+    if "quantization_config" in model_kwargs or cfg.gptq:
+        if "load_in_8bit" in model_kwargs:
+            del model_kwargs["load_in_8bit"]
+        if "load_in_4bit" in model_kwargs:
+            del model_kwargs["load_in_4bit"]
 
     # sample packing uses custom FA2 patch
     if cfg.flash_attention:
@@ -464,7 +494,7 @@ def load_model(
                 "flash_attention_2"
             )
         else:
-            if model_config.model_type in ["mixtral", "qwen2", "falcon", "phi"]:
+            if model_config.model_type in SUPPORTED_MULTIPACK_MODEL_TYPES:
                 model_kwargs["attn_implementation"] = "flash_attention_2"
                 model_config._attn_implementation = (  # pylint: disable=protected-access
                     "flash_attention_2"
@@ -474,6 +504,17 @@ def load_model(
                 model_config._attn_implementation = (  # pylint: disable=protected-access
                     "eager"
                 )
+    elif cfg.sdp_attention:
+        model_kwargs["attn_implementation"] = "sdpa"
+        model_config._attn_implementation = "sdpa"  # pylint: disable=protected-access
+    elif cfg.eager_attention:
+        model_kwargs["attn_implementation"] = "eager"
+        model_config._attn_implementation = "eager"  # pylint: disable=protected-access
+
+    if cfg.low_cpu_mem_usage:
+        model_kwargs["low_cpu_mem_usage"] = True
+
+    qlora_fsdp = cfg.fsdp and cfg.adapter == "qlora"
 
     try:
         if (
@@ -486,50 +527,23 @@ def load_model(
             model = LlamaForCausalLM.from_pretrained(
                 base_model,
                 config=model_config,
-                load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
-                load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
                 **model_kwargs,
             )
 
             if cfg.flash_attention and not inference:
                 from axolotl.monkeypatch.llama_attn_hijack_flash import (
+                    is_xformers_swiglu_available,
                     replace_llama_mlp_with_swiglu,
                     replace_llama_qkv_with_fused,
                 )
 
-                if cfg.flash_attn_fuse_mlp:
+                if cfg.flash_attn_fuse_mlp and is_xformers_swiglu_available():
                     LOG.info("patching with SwiGLU")
                     replace_llama_mlp_with_swiglu(model)
 
                 if cfg.flash_attn_fuse_qkv:
                     LOG.info("patching with fused QKV")
                     replace_llama_qkv_with_fused(model)
-        # elif model_type == "GPTNeoXForCausalLM" and cfg.flash_attention:
-        #     This is a WIP, still an issue with the backward pass
-        #     RuntimeError: grad can be implicitly created only for scalar outputs
-        #     TODO: try config.sequence_parallel = False
-        #     # https://github.com/HazyResearch/flash-attention/blob/40a25c8ee7465cf547b929cfa2937034e37bfce9/tests/models/test_gpt_neox.py#L12
-        #     # https://github.com/HazyResearch/flash-attention/tree/main/training#model-components
-        #     # add `**kwargs` to https://github.com/HazyResearch/flash-attention/blob/40a25c8ee7465cf547b929cfa2937034e37bfce9/flash_attn/models/gpt.py#L442
-        #     from flash_attn.utils.pretrained import state_dict_from_pretrained
-        #     from flash_attn.models.gpt import GPTLMHeadModel
-        #     from flash_attn.models.gpt_neox import remap_state_dict_hf_gpt_neox, gpt_neox_config_to_gpt2_config
-        #     from transformers import GPTNeoXConfig
-        #     config = gpt_neox_config_to_gpt2_config(GPTNeoXConfig.from_pretrained(base_model))
-        #     config.use_flash_attn = True
-        #     config.fused_bias_fc = True
-        #     config.fused_mlp = True  # GPT-NeoX-20B uses "gelu_fast"
-        #     config.activation_function = "gelu_fast"
-        #     config.fused_dropout_add_ln = True
-        #     # config.residual_in_fp32 = True
-        #
-        #     model: GPTLMHeadModel = GPTLMHeadModel.from_pretrained(
-        #         base_model,
-        #         config,
-        #         dtype=torch_dtype,
-        #         device=cfg.device,
-        #     )
-        #     model.train() # sets to train instead of eval mode
         elif model_type == "MambaLMHeadModel":
             # FIXME this is janky at best and hacked together to make it work
             MambaLMHeadModel = fix_mamba_attn_for_loss()  # pylint: disable=invalid-name
@@ -555,8 +569,6 @@ def load_model(
                 model = getattr(transformers, model_type).from_pretrained(
                     base_model,
                     config=model_config,
-                    load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
-                    load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
                     trust_remote_code=cfg.trust_remote_code or False,
                     **model_kwargs,
                 )
@@ -588,14 +600,15 @@ def load_model(
                 model = AutoModelForCausalLM.from_pretrained(
                     base_model,
                     config=model_config,
-                    load_in_8bit=cfg.load_in_8bit and cfg.adapter is not None,
-                    load_in_4bit=cfg.load_in_4bit and cfg.adapter is not None,
                     trust_remote_code=cfg.trust_remote_code or False,
                     **model_kwargs,
                 )
     except Exception as err:  # pylint: disable=broad-exception-caught
         LOG.exception(err)
         raise err
+
+    if isinstance(model, (PeftModel, PeftModelForCausalLM)) and not qlora_fsdp:
+        model = model.merge_and_unload()
 
     embeddings_len = (
         math.ceil(len(tokenizer) / 32) * 32
@@ -637,7 +650,7 @@ def load_model(
     ):
         model.config.eos_token_id = tokenizer.eos_token_id
 
-    if hasattr(model, "device") and model.device.type == "cuda":
+    if hasattr(model, "device") and model.device.type in ("cuda", "mps"):
         log_gpu_memory_usage(LOG, "after model load", model.device)
 
     # make sure these are fp32 per Ramesh et al. (2021)
@@ -645,7 +658,7 @@ def load_model(
     if not cfg.fsdp:
         # FSDP doesn't like mixed Float and BFloat16
         for name, module in model.named_modules():
-            if any(m in name for m in ["norm", "gate"]):
+            if "norm" in name or name.endswith(".gate"):
                 module.to(torch.float32)
             if model_config.model_type == "btlm":
                 # don't upcast lm_head for btlm
@@ -658,7 +671,9 @@ def load_model(
     skip_prepare_model_for_kbit_training = False
 
     if cfg.model_config_type == "mixtral" and is_deepspeed_zero3_enabled():
-        from deepspeed.utils import set_z3_leaf_modules
+        from deepspeed.utils import (  # pylint: disable=no-name-in-module
+            set_z3_leaf_modules,
+        )
         from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
         set_z3_leaf_modules(model, [MixtralSparseMoeBlock])
@@ -671,9 +686,14 @@ def load_model(
     if cfg.adapter == "lora" and loftq_bits:
         skip_prepare_model_for_kbit_training = True
 
+    if qlora_fsdp:
+        skip_prepare_model_for_kbit_training = True
+
     if cfg.adapter in ["lora", "qlora"]:
         if cfg.gradient_checkpointing:
-            model.gradient_checkpointing_enable()
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=cfg.gradient_checkpointing_kwargs
+            )
         if (
             cfg.load_in_8bit or cfg.load_in_4bit
         ) and not skip_prepare_model_for_kbit_training:
@@ -685,7 +705,7 @@ def load_model(
 
     # LlamaRMSNorm layers are in fp32 after kbit_training or full finetune, so we need to
     # convert them back to fp16/bf16 for flash-attn compatibility.
-    if needs_fa2_dtype or cfg.flash_attention:
+    if (needs_fa2_dtype or cfg.flash_attention) and not qlora_fsdp:
         LOG.info("converting modules to %s for flash attention", cfg.torch_dtype)
         for name, module in model.named_modules():
             if "norm" in name:
@@ -703,7 +723,12 @@ def load_model(
         else:
             model, lora_config = load_adapter(model, cfg, cfg.adapter)
 
-    if cfg.ddp and not load_in_8bit and not (cfg.rl and cfg.load_in_4bit):
+    if (
+        cfg.ddp
+        and not load_in_8bit
+        and not (cfg.rl and cfg.load_in_4bit)
+        and not qlora_fsdp
+    ):
         # TODO revaldate this conditional
         model.to(f"cuda:{cfg.local_rank}")
 
@@ -721,6 +746,8 @@ def load_model(
         model.config.use_cache = False
 
     if cfg.flash_optimum:
+        from optimum.bettertransformer import BetterTransformer
+
         model = BetterTransformer.transform(model)
 
     if cfg.adapter is not None:
@@ -747,7 +774,7 @@ def load_adapter(model, cfg, adapter, inference=False):
 
 def load_llama_adapter(model, cfg):
     # type: (PreTrainedModel, DictDefault) -> Tuple[PreTrainedModel, Optional[PeftConfig]]
-    from peft import AdaptionPromptConfig, PeftModel, get_peft_model
+    from peft import AdaptionPromptConfig, get_peft_model
 
     peft_config = AdaptionPromptConfig(
         adapter_layers=cfg.peft_adapter.layers,  # layers (L)
@@ -756,7 +783,7 @@ def load_llama_adapter(model, cfg):
     )
 
     if cfg.lora_model_dir:
-        LOG.debug("Loading pretained PEFT - llama_adapter")
+        LOG.debug("Loading pretrained PEFT - llama_adapter")
         model = PeftModel.from_pretrained(
             model,
             cfg.lora_model_dir,
@@ -790,10 +817,34 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
+def setup_quantized_meta_for_peft(model: nn.Module):
+    """Replaces `quant_state.to` with a dummy function to prevent PEFT from moving `quant_state` to meta device"""
+
+    def temp_to_method(self, *args, **kwargs):  # pylint: disable=unused-argument
+        return self
+
+    for param in model.parameters():
+        if isinstance(param, Params4bit):
+            param.quant_state._orig_to = (  # pylint: disable=protected-access
+                param.quant_state.to
+            )
+            param.quant_state.to = types.MethodType(temp_to_method, param.quant_state)
+
+
+def setup_quantized_peft_meta_for_training(model: nn.Module):
+    """Replaces dummy `quant_state.to` method with the original function to allow training to continue"""
+    for param in model.parameters():
+        if isinstance(param, Params4bit) and hasattr(param.quant_state, "_orig_to"):
+            param.quant_state.to = (
+                param.quant_state._orig_to  # pylint: disable=protected-access
+            )
+            param.quant_state._orig_to = None  # pylint: disable=protected-access
+
+
 def load_lora(model, cfg, inference=False, config_only=False):
     # type: (PreTrainedModel, DictDefault, bool, bool) -> Tuple[Optional[PreTrainedModel], Optional[PeftConfig]]
 
-    from peft import LoraConfig, PeftModel, get_peft_model
+    from peft import LoraConfig, get_peft_model
 
     lora_target_modules = list(cfg.lora_target_modules or [])
 
@@ -807,6 +858,12 @@ def load_lora(model, cfg, inference=False, config_only=False):
     if loftq_bits:
         lora_config_kwargs["loftq_config"] = LoftQConfig(loftq_bits=loftq_bits)
         lora_config_kwargs["init_lora_weights"] = "loftq"
+    if cfg.peft_use_dora:
+        lora_config_kwargs["use_dora"] = cfg.peft_use_dora
+    if cfg.peft_use_rslora:
+        lora_config_kwargs["use_rslora"] = cfg.peft_use_rslora
+    if cfg.peft_layer_replication:
+        lora_config_kwargs["layer_replication"] = cfg.peft_layer_replication
 
     lora_config = LoraConfig(
         r=cfg.lora_r,
@@ -824,8 +881,13 @@ def load_lora(model, cfg, inference=False, config_only=False):
     if config_only:
         return None, lora_config
 
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if cfg.fsdp and cfg.adapter == "qlora" and rank != 0:
+        setup_quantized_meta_for_peft(model)
+
     if cfg.lora_model_dir:
-        LOG.debug("Loading pretained PEFT - LoRA")
+        LOG.debug("Loading pretrained PEFT - LoRA")
         model_kwargs: Any = {}
         if cfg.lora_on_cpu:
             model_kwargs["max_memory"] = {"cpu": "256GiB"}
@@ -839,6 +901,14 @@ def load_lora(model, cfg, inference=False, config_only=False):
     else:
         model = get_peft_model(model, lora_config)
 
-    model.print_trainable_parameters()
+    if rank == 0:
+        try:
+            model.print_trainable_parameters()
+        except AttributeError as exc:
+            LOG.warning(
+                "Exception caught during model.print_trainable_parameters(): %s", exc
+            )
+    elif cfg.fsdp and cfg.adapter == "qlora":
+        setup_quantized_peft_meta_for_training(model)
 
     return model, lora_config

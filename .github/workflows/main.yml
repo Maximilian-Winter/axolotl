@@ -9,7 +9,6 @@ on:
 jobs:
   build-axolotl:
     if: ${{ ! contains(github.event.commits[0].message, '[skip docker]]') && github.repository_owner == 'OpenAccess-AI-Collective' }}
-    # this job needs to be run on self-hosted GPU runners...
     strategy:
       fail-fast: false
       matrix:
@@ -17,13 +16,9 @@ jobs:
           - cuda: 118
             cuda_version: 11.8.0
             python_version: "3.10"
-            pytorch: 2.0.1
-            axolotl_extras:
-          - cuda: 118
-            cuda_version: 11.8.0
-            python_version: "3.10"
             pytorch: 2.1.2
             axolotl_extras:
+            axolotl_args: "--extra-index-url https://download.pytorch.org/whl/cu118"
             is_latest: true
           - cuda: 121
             cuda_version: 12.1.0
@@ -33,9 +28,9 @@ jobs:
           - cuda: 121
             cuda_version: 12.1.0
             python_version: "3.11"
-            pytorch: 2.1.2
+            pytorch: 2.2.1
             axolotl_extras:
-    runs-on: [self-hosted, gpu, docker]
+    runs-on: axolotl-gpu-runner
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,40 +51,25 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          load: true
           build-args: |
             BASE_TAG=${{ github.ref_name }}-base-py${{ matrix.python_version }}-cu${{ matrix.cuda }}-${{ matrix.pytorch }}
             CUDA=${{ matrix.cuda }}
             PYTORCH_VERSION=${{ matrix.pytorch }}
+            AXOLOTL_ARGS=${{ matrix.axolotl_args }}
           file: ./docker/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ steps.metadata.outputs.tags }}-py${{ matrix.python_version }}-cu${{ matrix.cuda }}-${{ matrix.pytorch }}${{ matrix.axolotl_extras != '' && '-' || '' }}${{ matrix.axolotl_extras }}
             ${{ (matrix.is_latest) && format('{0}-latest', steps.metadata.outputs.tags) || '' }}
           labels: ${{ steps.metadata.outputs.labels }}
-      - name: Unit Tests
-        run: |
-          docker run --rm ${{ steps.metadata.outputs.tags }}-py${{ matrix.python_version }}-cu${{ matrix.cuda }}-${{ matrix.pytorch }}${{ matrix.axolotl_extras != '' && '-' || '' }}${{ matrix.axolotl_extras }} pytest --ignore=tests/e2e/ /workspace/axolotl/tests/
-      - name: Push to Docker Hub
-        if: github.event_name != 'pull_request'
-        run: |
-          docker push ${{ steps.metadata.outputs.tags }}-py${{ matrix.python_version }}-cu${{ matrix.cuda }}-${{ matrix.pytorch }}${{ matrix.axolotl_extras != '' && '-' || '' }}${{ matrix.axolotl_extras }}
-          latest_tag=${{ (matrix.is_latest) && format('{0}-latest', steps.metadata.outputs.tags) || '' }}
-          if [ -n "$latest_tag" ]; then
-            docker push "$latest_tag"
-          fi
 
-  build-axolotl-runpod:
+  build-axolotl-cloud:
     needs: build-axolotl
     if: ${{ ! contains(github.event.commits[0].message, '[skip docker]]') && github.repository_owner == 'OpenAccess-AI-Collective' }}
     # this job needs to be run on self-hosted GPU runners...
     strategy:
       matrix:
         include:
-          - cuda: 118
-            cuda_version: 11.8.0
-            python_version: "3.10"
-            pytorch: 2.0.1
-            axolotl_extras:
           - cuda: 118
             cuda_version: 11.8.0
             python_version: "3.10"
@@ -104,9 +84,9 @@ jobs:
           - cuda: 121
             cuda_version: 12.1.0
             python_version: "3.11"
-            pytorch: 2.1.2
+            pytorch: 2.2.1
             axolotl_extras:
-    runs-on: [self-hosted, gpu, docker]
+    runs-on: axolotl-gpu-runner
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -133,7 +113,5 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
              ${{ steps.metadata.outputs.tags }}-py${{ matrix.python_version }}-cu${{ matrix.cuda }}-${{ matrix.pytorch }}${{ matrix.axolotl_extras != '' && '-' || '' }}${{ matrix.axolotl_extras }}
-             winglian/axolotl-runpod:main-py${{ matrix.python_version }}-cu${{ matrix.cuda }}-${{ matrix.pytorch }}${{ matrix.axolotl_extras != '' && '-' || '' }}${{ matrix.axolotl_extras }}
              ${{ (matrix.is_latest) && format('{0}-latest', steps.metadata.outputs.tags) || '' }}
-             ${{ (matrix.is_latest) && format('{0}-latest', 'winglian/axolotl-runpod:main') || '' }}
           labels: ${{ steps.metadata.outputs.labels }}

@@ -11,6 +11,7 @@ import torch.cuda
 from accelerate.logging import get_logger
 from datasets import set_caching_enabled
 from torch.utils.data import DataLoader, RandomSampler
+from transformers.utils import is_torch_bf16_gpu_available
 
 from axolotl.core.trainer_builder import HFCausalTrainerBuilder, HFDPOTrainerBuilder
 from axolotl.utils.distributed import is_main_process, reduce_and_broadcast, zero_first
@@ -124,9 +125,10 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                 eval_dataset = eval_dataset.remove_columns("attention_mask")
 
         if cfg.model_config_type == "falcon":
-            LOG.info("dropping token_type_ids column")
-            train_dataset = train_dataset.remove_columns("token_type_ids")
-            if eval_dataset:
+            LOG.info("dropping token_type_ids column if it exists")
+            if "token_type_ids" in train_dataset.column_names:
+                train_dataset = train_dataset.remove_columns("token_type_ids")
+            if eval_dataset and "token_type_ids" in eval_dataset.column_names:
                 eval_dataset = eval_dataset.remove_columns("token_type_ids")
 
         train_dataset = train_dataset.filter(
@@ -170,17 +172,21 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
     return train_dataset, eval_dataset
 
 
-def process_pretraining_datasets_for_packing(train_dataset, sequence_len):
+def process_pretraining_datasets_for_packing(
+    train_dataset, sequence_len, skip_position_ids=True
+):
     drop_long = partial(drop_long_seq, sequence_len=sequence_len)
 
     train_dataset = train_dataset.filter(
         drop_long,
         desc="Dropping Long Sequences",
     )
-    train_dataset = train_dataset.map(
-        add_position_ids,
-        desc="Add position_id column (Pretraining Sample Packing)",
-    )
+    if skip_position_ids:
+        train_dataset = train_dataset.map(
+            add_position_ids,
+            desc="Add position_id column (Pretraining Sample Packing)",
+        )
+
     return train_dataset
 
 
@@ -192,7 +198,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
             .apply(lambda x: len(x))  # pylint: disable=unnecessary-lambda
             .values
         )
-        LOG.debug(f"total_num_tokens: {total_num_tokens}", main_process_only=True)
+        LOG.debug(f"total_num_tokens: {total_num_tokens:_}", main_process_only=True)
         if update:
             cfg.total_num_tokens = total_num_tokens
 
@@ -206,7 +212,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
             .sum()
         )
         LOG.debug(
-            f"`total_supervised_tokens: {total_supervised_tokens}`",
+            f"`total_supervised_tokens: {total_supervised_tokens:_}`",
             main_process_only=True,
         )
         if update:
@@ -233,15 +239,21 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 * cfg.num_epochs
             )
             LOG.debug(
-                f"total_num_tokens: {cfg.total_num_tokens}, total_num_steps: {total_num_steps}",
+                f"total_num_tokens: {cfg.total_num_tokens:_}, total_num_steps: {total_num_steps:_}",
                 main_process_only=True,
             )
         else:
+            if cfg.flash_attention:
+                batch_size = 1
+                batch_max_len = cfg.micro_batch_size * cfg.sequence_len
+            else:
+                batch_size = cfg.micro_batch_size
+                batch_max_len = cfg.sequence_len
             sampler = MultipackBatchSampler(
                 sampler=RandomSampler(train_dataset),
-                batch_size=cfg.micro_batch_size,
+                batch_size=batch_size,
                 drop_last=True,
-                batch_max_len=cfg.micro_batch_size * cfg.sequence_len,
+                batch_max_len=batch_max_len,
                 lengths=get_dataset_lengths(train_dataset),
             )
 
@@ -249,7 +261,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 train_dataset.remove_columns(["length"]),
                 batch_sampler=sampler,
             )
-            data_loader_len = len(data_loader)
+            data_loader_len = len(data_loader) // cfg.batch_size
             actual_eff = sampler.efficiency()
             LOG.debug(f"data_loader_len: {data_loader_len}", main_process_only=True)
             # FIXME: is there a bug here somewhere? the total num steps depends
@@ -298,8 +310,14 @@ def setup_fsdp_envs(cfg):
         os.environ["FSDP_OFFLOAD_PARAMS"] = "true"
     if cfg.fsdp_config.fsdp_sync_module_states:
         os.environ["FSDP_SYNC_MODULE_STATES"] = "true"
+    if cfg.fsdp_config.fsdp_cpu_ram_efficient_loading:
+        os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
+    if cfg.fsdp_config.fsdp_use_orig_params:
+        os.environ["FSDP_USE_ORIG_PARAMS"] = "true"
     if cfg.fsdp_config.fsdp_state_dict_type:
         os.environ["FSDP_STATE_DICT_TYPE"] = cfg.fsdp_config.fsdp_state_dict_type
+    if cfg.fsdp_config.fsdp_auto_wrap_policy:
+        os.environ["FSDP_AUTO_WRAP_POLICY"] = cfg.fsdp_config.fsdp_auto_wrap_policy
     if cfg.fsdp_config.fsdp_transformer_layer_cls_to_wrap:
         os.environ[
             "FSDP_TRANSFORMER_CLS_TO_WRAP"
@@ -312,6 +330,11 @@ def prepare_optim_env(cfg):
     elif cfg.deepspeed:
         os.environ["ACCELERATE_USE_DEEPSPEED"] = "true"
         os.environ["ACCELERATE_DEEPSPEED_CONFIG_FILE"] = cfg.deepspeed
+
+    if (cfg.bf16 == "auto" and is_torch_bf16_gpu_available()) or cfg.bf16 is True:
+        os.environ["ACCELERATE_MIXED_PRECISION"] = "bf16"
+    elif cfg.fp16:
+        os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
 
 
 def setup_trainer(cfg, train_dataset, eval_dataset, model, tokenizer, total_num_steps):
